@@ -9,6 +9,10 @@ env:
   CI_NAME: Commit CI
 jobs:
   build:
+    # Upstream-only, same guard style as nightly-ci.yml.
+    # In a fork this would run 4 OS x 4 ABI on every single push; the
+    # fork-build.yml workflow covers that use case much more cheaply.
+    if: ${{ github.repository == 'osfans/trime' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
