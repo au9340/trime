@@ -1,0 +1,104 @@
+# SPDX-FileCopyrightText: 2015 - 2024 Rime community
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Fork-only workflow.
+#
+# Why this exists:
+#   - commit-ci.yml / pull-request-ci.yml build a 4 OS x 4 ABI matrix on every
+#     push. Useful upstream, expensive and slow in a personal fork.
+#   - nightly-ci.yml / release-ci.yml need signing secrets (SIGNING_KEY,
+#     KEY_STORE_PASSWORD, ALIAS, KEY_PASSWORD) that a fork does not have.
+#
+# This workflow builds one ABI on Linux only, needs no secrets, and is
+# triggered manually. Result: a debug APK you can sideload, plus the freshly
+# built librime_jni.so that you can drop into app/prebuilt to make local
+# (Android Studio) rebuilds much faster.
+
+name: Fork Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      abi:
+        description: "ABI to build"
+        required: true
+        default: "arm64-v8a"
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+          - x86_64
+          - armeabi-v7a,arm64-v8a,x86,x86_64
+
+env:
+  CI_NAME: Fork Build
+  BUILD_ABI: ${{ inputs.abi }}
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Fetch source code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: 25
+          # will restore cache of dependencies and wrappers
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "cmake;3.31.6"
+
+      # Delete this step if a formatting nit is blocking you from getting an APK.
+      - name: Check code style
+        run: |
+          make style-lint
+
+      - name: Calculate JNI cache hash
+        id: cache-hash
+        run: |
+          ./gradlew :app:calculateNativeCacheHash
+
+      # Keyed by ABI as well, so switching ABI does not poison this cache.
+      - name: Fetch JNI cache
+        uses: actions/cache@v6
+        id: jni-cache
+        with:
+          path: "app/prebuilt"
+          key: ubuntu-trime-jni-debug-${{ steps.cache-hash.outputs.native-cache-hash }}-${{ env.BUILD_ABI }}
+
+      - name: Build debug Trime
+        run: |
+          make debug
+
+      - name: Add JNI cache
+        if: ${{ !steps.jni-cache.outputs.cache-hit }}
+        shell: bash
+        run: cp -R app/build/intermediates/merged_native_libs/debug/mergeDebugNativeLibs/out/lib app/prebuilt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: trime-debug-${{ env.BUILD_ABI }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 30
+
+      - name: Upload librime_jni.so
+        uses: actions/upload-artifact@v7
+        with:
+          name: librime-jni-${{ env.BUILD_ABI }}
+          path: app/build/intermediates/merged_native_libs/debug/mergeDebugNativeLibs/out/lib/*
+          retention-days: 30
