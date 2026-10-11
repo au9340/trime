@@ -16,6 +16,8 @@ env:
   CI_NAME: Pull Request CI
 jobs:
   build:
+    # Upstream-only, same guard style as nightly-ci.yml.
+    if: ${{ github.repository == 'osfans/trime' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
