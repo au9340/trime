@@ -25,8 +25,13 @@ android {
         applicationId = "com.osfans.trime"
         minSdk = 21
         targetSdk = 37
-        versionCode = 20261101
-        versionName = "3.3.13"
+        // Both values can be overridden from the command line so that every CI
+        // build gets a strictly increasing versionCode and can therefore be
+        // installed as an update over the previous build (same signing key).
+        //   ./gradlew :app:assembleRelease -PtrimeVersionCode=20261234 -PtrimeVersionName=3.3.13-fork.1
+        // Falls back to the upstream values when not specified.
+        versionCode = (project.findProperty("trimeVersionCode") as String?)?.toInt() ?: 20261101
+        versionName = (project.findProperty("trimeVersionName") as String?) ?: "3.3.13"
 
         multiDexEnabled = true
         buildConfigField("String", "BUILDER", "\"${project.builder}\"")
