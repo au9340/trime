@@ -33,6 +33,13 @@ on:
     branches:
       - develop
 
+# Serialize builds per branch. Without this, a push that changes several files
+# (or two quick pushes) starts several builds at once, and they would race to
+# create the signing key -- which would break the "stable signature" guarantee.
+concurrency:
+  group: fork-build-${{ github.ref }}
+  cancel-in-progress: true
+
 # Needed to create/read the release that stores the signing key.
 permissions:
   contents: write
@@ -111,16 +118,20 @@ jobs:
               -storepass "$KEYSTORE_PASSWORD" \
               -keypass "$KEYSTORE_PASSWORD" \
               -dname "CN=trime personal fork, O=personal, C=CN"
-            gh release create ci-signing --repo "$REPO" \
-              --title "CI signing key" \
-              --notes "DO NOT DELETE.
 
-          Self-signed key used by the Fork Build workflow to sign release APKs.
-          Deleting this release makes the next build use a different signature,
-          after which the APK can no longer be installed over the previous one
-          without uninstalling the app first, which wipes its data (including
-          the Rime user dictionary)."
-            gh release upload ci-signing "$KEYSTORE_NAME" --repo "$REPO" --clobber
+            # Whoever creates the release first wins. Note there is no
+            # --clobber on the upload: a losing run must never overwrite the
+            # winning keystore, or the signature would change under our feet.
+            if gh release create ci-signing --repo "$REPO" \
+                 --title "CI signing key" \
+                 --notes "Do not delete. The Fork Build workflow reuses this key so that APK signatures, and therefore installed app data, stay stable across updates."; then
+              gh release upload ci-signing "$KEYSTORE_NAME" --repo "$REPO"
+            else
+              echo "::warning::Another run created the key first, adopting it."
+              rm -f "$KEYSTORE_NAME"
+              gh release download ci-signing --repo "$REPO" \
+                --pattern "$KEYSTORE_NAME" --dir . --clobber
+            fi
           fi
 
           {
