@@ -1,0 +1,170 @@
+# SPDX-FileCopyrightText: 2015 - 2024 Rime community
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Fork-only workflow.
+#
+# What it produces: a signed *release* APK that can be installed directly with
+# no uninstall step, for arm64-v8a only, with an automatically increasing
+# versionCode on every build.
+#
+# Why not just use upstream's workflows:
+#   - commit-ci / pull-request-ci build a 4 OS x 4 ABI matrix and only produce
+#     debug APKs.
+#   - nightly-ci / release-ci need SIGNING_KEY etc. from repo secrets.
+#
+# Signing: assembleRelease only signs when `project.signKeyFile` resolves to an
+# existing file (see build-logic/.../ProjectExtensions.kt). Without a keystore
+# Gradle emits app-release-unsigned.apk, which cannot be installed.
+#
+# The keystore MUST stay the same across builds. If the signature changes,
+# Android refuses to update an installed app (INSTALL_FAILED_UPDATE_INCOMPATIBLE)
+# and the only way forward is uninstall + reinstall, which wipes the app data,
+# including the Rime user dictionary and config you are tuning. So the key is
+# generated once and kept as a release asset in this fork.
+
+name: Fork Build
+
+on:
+  workflow_dispatch:
+  # Comment the `push` block out if you do not want a build on every commit
+  # (e.g. every time you sync with upstream).
+  push:
+    branches:
+      - develop
+
+# Needed to create/read the release that stores the signing key.
+permissions:
+  contents: write
+
+env:
+  CI_NAME: Fork Build
+  BUILD_ABI: arm64-v8a
+  # Bump this if upstream bumps its own versionCode above base + run_number.
+  BASE_VERSION_CODE: 20261101
+  BASE_VERSION_NAME: 3.3.13
+  KEYSTORE_NAME: ci-signing.jks
+  KEYSTORE_ALIAS: trimefork
+  # Throwaway password for a self-signed key whose whole purpose is personal
+  # sideloading. Keep it in sync with the values inside the stored keystore.
+  KEYSTORE_PASSWORD: trimefork
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Fetch source code
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v6
+        with:
+          distribution: "temurin"
+          java-version: 25
+          # will restore cache of dependencies and wrappers
+          cache: 'gradle'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android NDK
+        run: |
+          sdkmanager --install "cmake;3.31.6"
+
+      - name: Compute version
+        run: |
+          N="${{ github.run_number }}"
+          CODE="$(( BASE_VERSION_CODE + N ))"
+          NAME="${BASE_VERSION_NAME}-fork.${N}"
+          # ORG_GRADLE_PROJECT_* is picked up by Gradle as a project property,
+          # so this works even though `make release` passes no extra arguments.
+          {
+            echo "TRIME_VERSION_CODE=$CODE"
+            echo "TRIME_VERSION_NAME=$NAME"
+            echo "ORG_GRADLE_PROJECT_trimeVersionCode=$CODE"
+            echo "ORG_GRADLE_PROJECT_trimeVersionName=$NAME"
+          } >> "$GITHUB_ENV"
+          echo "Building $NAME (versionCode $CODE)"
+
+      - name: Restore or create signing key
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+
+          if gh release view ci-signing --repo "$REPO" >/dev/null 2>&1; then
+            echo "::notice::Reusing the existing signing key, signature stays stable."
+            gh release download ci-signing --repo "$REPO" \
+              --pattern "$KEYSTORE_NAME" --dir . --clobber
+          else
+            echo "::notice::First run: generating the signing key."
+            keytool -genkeypair \
+              -keystore "$KEYSTORE_NAME" \
+              -alias "$KEYSTORE_ALIAS" \
+              -keyalg RSA -keysize 4096 -validity 20000 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEYSTORE_PASSWORD" \
+              -dname "CN=trime personal fork, O=personal, C=CN"
+            gh release create ci-signing --repo "$REPO" \
+              --title "CI signing key" \
+              --notes "DO NOT DELETE.
+
+          Self-signed key used by the Fork Build workflow to sign release APKs.
+          Deleting this release makes the next build use a different signature,
+          after which the APK can no longer be installed over the previous one
+          without uninstalling the app first, which wipes its data (including
+          the Rime user dictionary)."
+            gh release upload ci-signing "$KEYSTORE_NAME" --repo "$REPO" --clobber
+          fi
+
+          {
+            echo "storeFile=$PWD/$KEYSTORE_NAME"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEYSTORE_ALIAS"
+            echo "keyPassword=$KEYSTORE_PASSWORD"
+          } > keystore.properties
+
+      - name: Calculate JNI cache hash
+        id: cache-hash
+        run: |
+          ./gradlew :app:calculateNativeCacheHash
+
+      # Keyed by ABI as well, so switching ABI does not poison this cache.
+      - name: Fetch JNI cache
+        uses: actions/cache@v6
+        id: jni-cache
+        with:
+          path: "app/prebuilt"
+          key: ubuntu-trime-jni-release-${{ steps.cache-hash.outputs.native-cache-hash }}-${{ env.BUILD_ABI }}
+
+      # `make release` runs patch-apply first and then assembleRelease.
+      - name: Build release Trime
+        run: |
+          make release
+
+      - name: Add JNI cache
+        if: ${{ !steps.jni-cache.outputs.cache-hit }}
+        shell: bash
+        run: cp -R app/build/intermediates/merged_native_libs/release/mergeReleaseNativeLibs/out/lib app/prebuilt
+
+      - name: Verify APK is signed
+        run: |
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort | tail -1)"
+          for apk in app/build/outputs/apk/release/*.apk; do
+            echo "== $apk"
+            sha256sum "$apk"
+            "$APKSIGNER" verify --print-certs "$apk"
+          done
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: trime-release-arm64-v8a-${{ env.TRIME_VERSION_NAME }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
